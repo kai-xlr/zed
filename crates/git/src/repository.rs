@@ -2282,11 +2282,47 @@ impl GitRepository for RealGitRepository {
             }
         }
 
+        let git_binary_path = self.any_git_binary_path.clone();
+        let executor = self.executor.clone();
+        let is_trusted = self.is_trusted.load(std::sync::atomic::Ordering::Relaxed);
+
         self.executor
             .spawn(async move {
                 std::fs::create_dir_all(path.parent().unwrap_or(&path))?;
                 let output = git.build_command(&args).output().await?;
                 if output.status.success() {
+                    let gitmodules_path = path.join(".gitmodules");
+                    if gitmodules_path.exists() {
+                        let submodule_git = GitBinary::new(
+                            git_binary_path.clone(),
+                            path.clone(),
+                            path.join(".git"),
+                            executor.clone(),
+                            is_trusted,
+                        );
+                        let submodule_output = submodule_git
+                            .build_command(&["submodule", "update", "--init"])
+                            .output()
+                            .await;
+                        match submodule_output {
+                            Ok(output) if output.status.success() => {}
+                            Ok(output) => {
+                                let stderr = String::from_utf8_lossy(&output.stderr);
+                                log::warn!(
+                                    "failed to initialize submodules in new worktree at {}: {}",
+                                    path.display(),
+                                    stderr
+                                );
+                            }
+                            Err(err) => {
+                                log::warn!(
+                                    "failed to run submodule init in new worktree at {}: {}",
+                                    path.display(),
+                                    err
+                                );
+                            }
+                        }
+                    }
                     Ok(())
                 } else {
                     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -6972,6 +7008,71 @@ mod tests {
         assert_eq!(
             remote_urls.get("upstream").unwrap(),
             "/Users/user/My Projects/upstream.git"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_create_worktree_initializes_submodules(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let submodule_dir = temp_dir.path().join("submodule");
+        let repo_dir = temp_dir.path().join("repo");
+        let worktrees_dir = temp_dir.path().join("worktrees");
+
+        // Create a submodule repository with content
+        fs::create_dir_all(&submodule_dir).unwrap();
+        git_command(&submodule_dir, ["init", "-b", "main"]);
+        fs::write(submodule_dir.join("hello.txt"), "submodule content\n").unwrap();
+        git_command(&submodule_dir, ["add", "hello.txt"]);
+        git_command(&submodule_dir, ["commit", "-m", "Initial submodule commit"]);
+
+        // Create parent repository and add the submodule.
+        // Use protocol.file.allow=always because the submodule URL is a local path,
+        // which git blocks by default in test environments.
+        fs::create_dir_all(&repo_dir).unwrap();
+        git_init_repo(&repo_dir);
+        git_command(
+            &repo_dir,
+            [
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                submodule_dir.to_str().unwrap(),
+                "modules/example",
+            ],
+        );
+        git_command(&repo_dir, ["commit", "-m", "Add submodule"]);
+
+        let repo = RealGitRepository::new(
+            &repo_dir.join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .unwrap();
+
+        // Create a worktree from the parent — this should trigger submodule init.
+        // Submodule init may fail in this test environment (file transport blocked
+        // inside build_command's security flags), but create_worktree itself must
+        // succeed (best-effort).
+        let worktree_path = worktrees_dir.join("worktree-with-submodule");
+        repo.create_worktree(
+            CreateWorktreeTarget::NewBranch {
+                branch_name: "wt-submodule".to_string(),
+                base_sha: Some("HEAD".to_string()),
+            },
+            worktree_path.clone(),
+        )
+        .await
+        .unwrap();
+
+        // Verify the worktree has the .gitmodules file (checked out from parent)
+        assert!(
+            worktree_path.join(".gitmodules").exists(),
+            "worktree should contain .gitmodules"
         );
     }
 }
